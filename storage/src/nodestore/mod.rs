@@ -96,6 +96,7 @@ pub use header::NodeStoreHeader;
 /// I --> |commit|N("New commit NodeStore&lt;Committed, S&gt;")
 /// style E color:#FFFFFF, fill:#AA00FF, stroke:#AA00FF
 /// ```
+use std::marker::PhantomData;
 use std::mem::take;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -104,7 +105,8 @@ use crate::hashednode::hash_node;
 use crate::node::Node;
 use crate::node::persist::MaybePersistedNode;
 use crate::{
-    CacheReadStrategy, Child, FileIoError, HashType, Path, ReadableStorage, SharedNode, TrieHash,
+    CacheReadStrategy, Child, DefaultHashMode, FileIoError, HashType, Path, ReadableStorage,
+    SharedNode, TrieHash,
 };
 
 use super::linear::WritableStorage;
@@ -151,6 +153,7 @@ impl<S: ReadableStorage> NodeStore<Committed, S> {
             storage,
             must_recompute_storage_hash: header.must_recompute_storage_hash(),
             deleted_node_tracking,
+            _hash_mode: PhantomData,
         };
 
         if let Some(root_address) = header.root_address() {
@@ -190,6 +193,7 @@ impl<S: ReadableStorage> NodeStore<Committed, S> {
             // need to recompute them.
             must_recompute_storage_hash: header::Version::new().must_recompute_storage_hash(),
             deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 
@@ -223,6 +227,7 @@ impl<S: ReadableStorage> NodeStore<Committed, S> {
             storage,
             must_recompute_storage_hash: header.must_recompute_storage_hash(),
             deleted_node_tracking,
+            _hash_mode: PhantomData,
         };
 
         let node = nodestore.read_node(root_address)?;
@@ -358,6 +363,7 @@ impl<S: ReadableStorage> NodeStore<Mutable<Propose>, S> {
             storage: parent.storage.clone(),
             must_recompute_storage_hash: parent.must_recompute_storage_hash,
             deleted_node_tracking: parent.deleted_node_tracking,
+            _hash_mode: PhantomData,
         })
     }
 
@@ -401,6 +407,7 @@ impl<S: ReadableStorage> NodeStore<Mutable<Propose>, S> {
             storage: parent.storage.clone(),
             must_recompute_storage_hash: parent.must_recompute_storage_hash,
             deleted_node_tracking: parent.deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -464,6 +471,7 @@ impl<S: ReadableStorage> NodeStore<Mutable<Recon<S>>, S> {
             storage: parent.storage.clone(),
             must_recompute_storage_hash: parent.must_recompute_storage_hash,
             deleted_node_tracking: parent.deleted_node_tracking,
+            _hash_mode: PhantomData,
         })
     }
 }
@@ -525,6 +533,7 @@ impl<S: WritableStorage> NodeStore<Mutable<Propose>, S> {
             // correct storageRoots at hash time.
             must_recompute_storage_hash: header::Version::new().must_recompute_storage_hash(),
             deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -551,6 +560,7 @@ impl<S: ReadableStorage> NodeStore<Mutable<Recon<S>>, S> {
             // Reconstruction views never participate in the future-delete
             // log, so this value is irrelevant here.
             deleted_node_tracking: DeletedNodeTracking::Enabled,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -856,7 +866,7 @@ impl ImmutableProposal {
 /// 4. Chain further reconstructions: convert back to [`Mutable<Recon>`] via [`From`] and repeat.
 ///
 #[derive(Debug)]
-pub struct NodeStore<T, S> {
+pub struct NodeStore<T, S, H = DefaultHashMode> {
     /// This is one of [Committed], [`ImmutableProposal`], [`Mutable<Propose>`], [`Mutable<Recon>`], or [`Reconstructed`].
     kind: T,
     /// Persisted storage to read nodes from.
@@ -870,6 +880,10 @@ pub struct NodeStore<T, S> {
     /// never be consumed (e.g. archival mode, where old nodes are preserved on
     /// disk for historical queries), so proposals skip building it entirely.
     deleted_node_tracking: DeletedNodeTracking,
+    /// The node-hashing scheme ([`HashMode`]). Zero-sized; defaulted to the
+    /// compile-selected mode ([`DefaultHashMode`]) while `H` is threaded
+    /// through the stack, and selected per database at runtime after #1088.
+    _hash_mode: PhantomData<H>,
 }
 
 /// Whether removed and replaced nodes are recorded in the future-delete log
@@ -1017,6 +1031,7 @@ impl<S: ReadableStorage> From<NodeStore<Reconstructed<S>, S>> for NodeStore<Muta
             storage: val.storage,
             must_recompute_storage_hash: val.must_recompute_storage_hash,
             deleted_node_tracking: val.deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -1035,6 +1050,7 @@ impl<S: ReadableStorage> From<NodeStore<Mutable<Recon<S>>, S>> for NodeStore<Rec
             storage: val.storage,
             must_recompute_storage_hash: val.must_recompute_storage_hash,
             deleted_node_tracking: val.deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -1070,6 +1086,7 @@ impl<S> Clone for NodeStore<Reconstructed<S>, S> {
             storage: self.storage.clone(),
             must_recompute_storage_hash: self.must_recompute_storage_hash,
             deleted_node_tracking: self.deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -1124,6 +1141,7 @@ impl<S: WritableStorage> NodeStore<Arc<ImmutableProposal>, S> {
             storage: self.storage.clone(),
             must_recompute_storage_hash: self.must_recompute_storage_hash,
             deleted_node_tracking: self.deleted_node_tracking,
+            _hash_mode: PhantomData,
         }
     }
 }
@@ -1139,6 +1157,7 @@ impl<S: ReadableStorage> TryFrom<NodeStore<Mutable<Propose>, S>>
             storage,
             must_recompute_storage_hash,
             deleted_node_tracking,
+            _hash_mode: _,
         } = val;
         let Mutable {
             root,
@@ -1154,6 +1173,7 @@ impl<S: ReadableStorage> TryFrom<NodeStore<Mutable<Propose>, S>>
             storage,
             must_recompute_storage_hash,
             deleted_node_tracking,
+            _hash_mode: PhantomData,
         };
 
         let Some(root) = root else {
