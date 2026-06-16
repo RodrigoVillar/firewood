@@ -519,7 +519,7 @@ mod format_node_value_tests {
         assert_eq!(fmt(b"hi there"), " val=686920...");
     }
 
-    #[cfg(feature = "ethhash")]
+    #[firewood_macros::hash_mode(eth)]
     #[test]
     fn rlp_list_decoded() {
         use ::rlp::RlpStream;
@@ -531,7 +531,7 @@ mod format_node_value_tests {
         assert_eq!(fmt(&encoded), " rlp=[01,02]");
     }
 
-    #[cfg(feature = "ethhash")]
+    #[firewood_macros::hash_mode(eth)]
     #[test]
     fn empty_rlp_list_falls_through() {
         // 0xc0 is an empty RLP list — as_list returns Ok([]) which we

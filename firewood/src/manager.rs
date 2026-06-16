@@ -1079,7 +1079,7 @@ mod tests {
     /// `revision()` previously fell through to `RootStore::get` and returned
     /// `RevisionNotFound`. The fix synthesizes an empty committed nodestore
     /// when the caller asks for the default empty-trie hash.
-    #[cfg(feature = "ethhash")]
+    #[firewood_macros::hash_mode(eth)]
     #[test]
     fn test_revision_empty_root_after_eviction() {
         use firewood_storage::{LeafNode, NibblesIterator, Node, Path};

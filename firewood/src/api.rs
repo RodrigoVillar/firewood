@@ -574,8 +574,8 @@ pub trait Proposal: DbView {
 mod tests {
     use super::*;
 
+    #[firewood_macros::hash_mode(eth)]
     #[test]
-    #[cfg(feature = "ethhash")]
     fn test_ethhash_compat_default_root_hash_equals_empty_rlp_hash() {
         use sha3::Digest as _;
 
@@ -585,8 +585,8 @@ mod tests {
         );
     }
 
+    #[firewood_macros::hash_mode(merkledb)]
     #[test]
-    #[cfg(not(feature = "ethhash"))]
     fn test_firewood_default_root_hash_equals_none() {
         assert_eq!(TrieHash::default_root_hash(), None);
     }

@@ -1,11 +1,12 @@
 // Copyright (C) 2023, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE.md for licensing terms.
 
-//! Proc macros for Firewood metrics
+//! Proc macros for Firewood.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::{ItemFn, ReturnType, parse_macro_input};
 
 /// Arguments for the `#[metrics]` attribute: a single identifier naming a counter constant in
@@ -145,6 +146,100 @@ fn generate_metrics_wrapper(input_fn: &ItemFn, ident: &syn::Ident) -> proc_macro
     }
 }
 
+/// Hash modes a test runs under, parsed from `#[hash_mode(...)]` arguments.
+struct HashModeArgs {
+    eth: bool,
+    merkledb: bool,
+}
+
+impl Parse for HashModeArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let idents = Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(input)?;
+        if idents.is_empty() {
+            return Err(syn::Error::new(
+                input.span(),
+                "expected at least one hash mode, e.g. #[hash_mode(eth)] or #[hash_mode(eth, merkledb)]",
+            ));
+        }
+        let mut args = HashModeArgs {
+            eth: false,
+            merkledb: false,
+        };
+        for ident in &idents {
+            let slot = match ident.to_string().as_str() {
+                "eth" => &mut args.eth,
+                "merkledb" => &mut args.merkledb,
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        format!("unknown hash mode `{other}`; expected `eth` or `merkledb`"),
+                    ));
+                }
+            };
+            if *slot {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    format!("duplicate hash mode `{ident}`"),
+                ));
+            }
+            *slot = true;
+        }
+        Ok(args)
+    }
+}
+
+/// Annotates a test (or any item) with the hash configuration(s) it runs under.
+///
+/// Today this expands to the equivalent compile-time gate, so behavior is
+/// identical to a hand-written `#[cfg]`:
+///
+/// - `#[hash_mode(eth)]`           → `#[cfg(feature = "ethhash")]`
+/// - `#[hash_mode(merkledb)]`      → `#[cfg(not(feature = "ethhash"))]`
+/// - `#[hash_mode(eth, merkledb)]` → no gate (compiled in both)
+///
+/// It exists so that, once the `ethhash` feature is removed (issue #1088),
+/// these annotations can be re-wired to select the hash mode at runtime and run
+/// the full suite under every mode in a single binary — without revisiting each
+/// test's gate by hand.
+///
+/// Place it above `#[test]`:
+///
+/// ```rust,ignore
+/// use firewood_macros::hash_mode;
+///
+/// #[hash_mode(eth)]
+/// #[test]
+/// fn only_under_ethhash() { /* ... */ }
+/// ```
+#[proc_macro_attribute]
+pub fn hash_mode(args: TokenStream, input: TokenStream) -> TokenStream {
+    let parsed = match syn::parse::<HashModeArgs>(args) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let gate = hash_mode_gate(&parsed);
+    let item: proc_macro2::TokenStream = input.into();
+    quote! {
+        #gate
+        #item
+    }
+    .into()
+}
+
+/// Maps the declared hash modes to the compile-time gate they currently expand
+/// to. Factored out so it can be unit-tested without a `proc_macro` context.
+fn hash_mode_gate(args: &HashModeArgs) -> proc_macro2::TokenStream {
+    if args.eth && args.merkledb {
+        // Runs under both modes: no gate.
+        quote! {}
+    } else if args.eth {
+        quote! { #[cfg(feature = "ethhash")] }
+    } else {
+        // merkledb only — parsing guarantees at least one mode is set.
+        quote! { #[cfg(not(feature = "ethhash"))] }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used)]
@@ -207,5 +302,55 @@ mod tests {
         );
         assert!(generated_code.contains("counter"));
         assert!(generated_code.contains("histogram"));
+    }
+
+    #[test]
+    fn test_hash_mode_args_parsing() {
+        let eth: HashModeArgs = syn::parse2(quote::quote! { eth }).unwrap();
+        assert!(eth.eth && !eth.merkledb);
+
+        let merkledb: HashModeArgs = syn::parse2(quote::quote! { merkledb }).unwrap();
+        assert!(!merkledb.eth && merkledb.merkledb);
+
+        let both: HashModeArgs = syn::parse2(quote::quote! { eth, merkledb }).unwrap();
+        assert!(both.eth && both.merkledb);
+    }
+
+    #[test]
+    fn test_hash_mode_invalid_args() {
+        // empty list
+        assert!(syn::parse2::<HashModeArgs>(quote::quote! {}).is_err());
+        // unknown mode
+        assert!(syn::parse2::<HashModeArgs>(quote::quote! { sha256 }).is_err());
+        // duplicate mode
+        assert!(syn::parse2::<HashModeArgs>(quote::quote! { eth, eth }).is_err());
+    }
+
+    #[test]
+    fn test_hash_mode_gate_tokens() {
+        let eth_gate = hash_mode_gate(&HashModeArgs {
+            eth: true,
+            merkledb: false,
+        });
+        assert_eq!(
+            eth_gate.to_string(),
+            quote::quote! { #[cfg(feature = "ethhash")] }.to_string()
+        );
+
+        let merkledb_gate = hash_mode_gate(&HashModeArgs {
+            eth: false,
+            merkledb: true,
+        });
+        assert_eq!(
+            merkledb_gate.to_string(),
+            quote::quote! { #[cfg(not(feature = "ethhash"))] }.to_string()
+        );
+
+        // both modes => no gate
+        let both_gate = hash_mode_gate(&HashModeArgs {
+            eth: true,
+            merkledb: true,
+        });
+        assert!(both_gate.to_string().is_empty());
     }
 }
