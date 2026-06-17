@@ -118,7 +118,7 @@ fn bench_db<const N: usize>(criterion: &mut Criterion) {
                     let db_path = TempDir::new().unwrap();
                     let db_path = db_path.path().join("benchmark_db");
                     let cfg = DbConfig::builder()
-                        .node_hash_algorithm(NodeHashAlgorithm::compile_option())
+                        .node_hash_algorithm(<firewood_storage::DefaultHashMode as firewood_storage::HashMode>::ALGORITHM)
                         .truncate(true)
                         .build();
                     let db = firewood::db::Db::new(db_path, cfg).unwrap();

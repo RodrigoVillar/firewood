@@ -12,7 +12,7 @@ mod tests;
 pub use crate::api::BatchOp;
 use crate::api::{
     self, ArcDynDbView, FrozenChangeProof, FrozenProof, FrozenRangeProof, HashKey, IntoBatchIter,
-    KeyType, KeyValuePair, OptionalHashKeyExt,
+    KeyType, KeyValuePair,
 };
 use crate::iter::MerkleKeyValueIter;
 use crate::merkle::changes::DiffMerkleNodeStream;
@@ -22,9 +22,10 @@ use crate::verify_change_proof_structure;
 use crate::manager::{ConfigManager, RevisionManager, RevisionManagerConfig};
 use firewood_metrics::{firewood_counter, firewood_histogram};
 use firewood_storage::{
-    CheckOpt, CheckerReport, Committed, CommittedParentHash, FileBacked, FileIoError,
-    HashedNodeReader, ImmutableProposal, NodeHashAlgorithm, NodeStore, Parentable, ReadableStorage,
-    Reconstructed, ReconstructionSource, TrieReader,
+    CheckOpt, CheckerReport, Committed, CommittedParentHash, DefaultHashMode, EthHash, FileBacked,
+    FileIoError, HashMode, HashedNodeReader, ImmutableProposal, MerkleDbHash, Mutable,
+    NodeHashAlgorithm, NodeStore, Parentable, Propose, ReadableStorage, Reconstructed,
+    ReconstructionSource, TrieReader,
 };
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -32,6 +33,10 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use typed_builder::TypedBuilder;
+
+/// An owned key/value pair, used at the dyn boundary when re-expressing a
+/// collected batch as merge key/values.
+type KeyValueOwned = (Box<[u8]>, Box<[u8]>);
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -42,9 +47,9 @@ pub enum DbError {
     FileIo(#[from] FileIoError),
 }
 
-impl<P, S: ReadableStorage> api::DbView for NodeStore<P, S>
+impl<P, S: ReadableStorage, H: HashMode> api::DbView for NodeStore<P, S, H>
 where
-    NodeStore<P, S>: HashedNodeReader,
+    NodeStore<P, S, H>: HashedNodeReader,
 {
     type Iter<'view>
         = MerkleKeyValueIter<'view, Self>
@@ -52,7 +57,11 @@ where
         Self: 'view;
 
     fn root_hash(&self) -> Option<HashKey> {
-        HashedNodeReader::root_hash(self).or_default_root_hash()
+        // Resolve the empty-trie root via the runtime hash mode `H`, not the
+        // build's compile default, so an empty `Db<EthHash>` reports
+        // `Some(keccak256(0x80))` and an empty `Db<MerkleDbHash>` reports `None`
+        // regardless of the binary's `ethhash` feature.
+        HashedNodeReader::root_hash(self).or_else(H::default_root_hash)
     }
 
     fn val<K: api::KeyType>(&self, key: K) -> Result<Option<Value>, api::Error> {
@@ -104,7 +113,10 @@ pub enum UseParallel {
 #[non_exhaustive]
 pub struct DbConfig {
     /// The algorithm used for hashing nodes (required).
-    #[cfg_attr(test, builder(default = NodeHashAlgorithm::compile_option()))]
+    ///
+    /// In tests this defaults to the [`DefaultHashMode`]'s algorithm so that
+    /// the builder pairs with the compile-selected `Db<DefaultHashMode>`.
+    #[cfg_attr(test, builder(default = DefaultHashMode::ALGORITHM))]
     pub node_hash_algorithm: NodeHashAlgorithm,
     /// Whether to create the DB if it doesn't exist.
     #[builder(default = true)]
@@ -131,17 +143,24 @@ pub struct DbConfig {
 /// Callers **must** call `close()` when they are done with the database
 /// to ensure the latest committed revision is persisted to disk. Dropping a
 /// database without calling `close()` may result in committed data being lost.
+/// A database instance generic over its node-hashing scheme `H`.
+///
+/// `H` carries the hash mode as a type parameter so the proof verify/write
+/// paths can name it (e.g. `Proposal<'_, H>`). The default `DefaultHashMode`
+/// keeps existing concrete callers (`Db::new`, FFI, `fwdctl`) compiling as
+/// `Db<DefaultHashMode>`. The internal nodestores remain pinned to the
+/// storage-supported default mode; `H` is presently always `DefaultHashMode`.
 #[derive(Debug)]
-pub struct Db {
-    manager: RevisionManager,
+pub struct Db<H = DefaultHashMode> {
+    manager: RevisionManager<H>,
     use_parallel: UseParallel,
 }
 
-impl api::Db for Db {
-    type Historical = NodeStore<Committed, FileBacked>;
+impl<H: HashMode> api::Db for Db<H> {
+    type Historical = NodeStore<Committed, FileBacked, H>;
 
     type Proposal<'db>
-        = Proposal<'db>
+        = Proposal<'db, H>
     where
         Self: 'db;
 
@@ -151,20 +170,210 @@ impl api::Db for Db {
     }
 
     fn root_hash(&self) -> Option<HashKey> {
-        self.manager.root_hash().or_default_root_hash()
+        // Resolve the empty-trie root via the runtime hash mode `H` so a fresh
+        // `Db<H>` reports the correct empty root regardless of the binary.
+        self.manager.root_hash().or_else(H::default_root_hash)
     }
 
     fn propose(&self, batch: impl IntoBatchIter) -> Result<Self::Proposal<'_>, api::Error> {
         // Proposal created from db
         firewood_counter!(PROPOSALS_CREATED, "base" => "db").increment(1);
 
-        self.propose_with_parent(batch, &self.manager.current_revision())
+        self.propose_with_parent(batch, &*self.manager.current_revision())
+    }
+}
+
+// The dyn boundary: erase a concrete `Db<H>` to `Box<dyn DynDb>` so a single
+// binary can hold databases of different hash modes behind one type. The
+// generic batch is pre-collected into an `OwnedBatch` at the boundary because a
+// generic `impl IntoBatchIter` method is not object-safe.
+impl<H: HashMode> api::DynDb for Db<H> {
+    fn revision(&self, hash: HashKey) -> Result<ArcDynDbView, api::Error> {
+        let nodestore = self.manager.revision(hash)?;
+        Ok(nodestore as ArcDynDbView)
+    }
+
+    fn root_hash(&self) -> Option<HashKey> {
+        api::Db::root_hash(self)
+    }
+
+    fn view(&self, hash: HashKey) -> Result<ArcDynDbView, api::Error> {
+        Db::view(self, hash)
+    }
+
+    fn propose(
+        &self,
+        ops: api::OwnedBatch,
+    ) -> Result<Box<dyn api::DynProposal<'_> + '_>, api::Error> {
+        let proposal = api::Db::propose(self, ops)?;
+        Ok(Box::new(proposal))
+    }
+
+    fn node_hash_algorithm(&self) -> NodeHashAlgorithm {
+        H::ALGORITHM
+    }
+
+    fn dump_to_string(&self) -> Result<String, api::Error> {
+        Db::dump_to_string(self).map_err(api::Error::from)
+    }
+
+    fn change_proof(
+        &self,
+        start_hash: HashKey,
+        end_hash: HashKey,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        limit: Option<NonZeroUsize>,
+    ) -> Result<FrozenChangeProof, api::Error> {
+        Db::change_proof(self, start_hash, end_hash, start_key, end_key, limit)
+    }
+
+    fn verify_change_proof(
+        &self,
+        proof: &FrozenChangeProof,
+        end_root: HashKey,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        max_length: Option<NonZeroUsize>,
+    ) -> Result<Box<dyn api::DynProposal<'_> + '_>, api::Error> {
+        let proposal =
+            Db::verify_change_proof(self, proof, end_root, start_key, end_key, max_length)?;
+        Ok(Box::new(proposal))
+    }
+
+    fn merge_key_value_range(
+        &self,
+        first_key: Option<&[u8]>,
+        last_key: Option<&[u8]>,
+        key_values: api::OwnedBatch,
+    ) -> Result<Box<dyn api::DynProposal<'_> + '_>, api::Error> {
+        // The merge path takes key/value *pairs*, not batch ops; pull the puts
+        // out of the collected batch (the FFI only ever hands us puts here).
+        // `OwnedBatch` permits Delete/DeleteRange, so error on those rather than
+        // silently dropping them (which would be undetectable data loss).
+        let pairs = key_values
+            .into_vec()
+            .into_iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => Ok((key, value)),
+                BatchOp::Delete { .. } | BatchOp::DeleteRange { .. } => {
+                    Err(api::Error::FeatureNotSupported(
+                        "merge_key_value_range only accepts Put operations".into(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<KeyValueOwned>, api::Error>>()?;
+        let proposal = Db::merge_key_value_range(self, first_key, last_key, pairs)?;
+        Ok(Box::new(proposal))
+    }
+
+    fn reconstruct_from_view(
+        &self,
+        parent: &Arc<NodeStore<Committed, FileBacked>>,
+        batch: api::OwnedBatch,
+    ) -> Result<ReconstructedView<'_>, api::Error> {
+        Db::reconstruct_from_view(self, parent, batch)
+    }
+
+    fn reconstruct_from_reconstructed(
+        &self,
+        parent: Arc<NodeStore<Reconstructed<FileBacked>, FileBacked>>,
+        batch: api::OwnedBatch,
+    ) -> Result<ReconstructedView<'_>, api::Error> {
+        Db::reconstruct_from_reconstructed(self, parent, batch)
+    }
+
+    fn historical_revision(
+        &self,
+        hash: HashKey,
+    ) -> Result<Option<Arc<NodeStore<Committed, FileBacked>>>, api::Error> {
+        // Reconstruction is `DefaultHashMode`-only, so only a default-mode
+        // database can hand back the concrete committed nodestore. Recover the
+        // concrete `Db<DefaultHashMode>` via downcast. A non-default mode is a
+        // distinct condition from a missing revision: surface it as an explicit
+        // `FeatureNotSupported` error rather than the ambiguous `Ok(None)` (which
+        // would later be misreported as a missing committed revision handle).
+        let Some(default_db) = (self as &dyn std::any::Any).downcast_ref::<Db<DefaultHashMode>>()
+        else {
+            return Err(api::Error::FeatureNotSupported(format!(
+                "reconstruct is only supported for the build's default hash mode \
+                 ({:?})",
+                DefaultHashMode::ALGORITHM,
+            )));
+        };
+        match default_db.manager.revision(hash) {
+            Ok(rev) => Ok(Some(rev)),
+            // A genuinely missing revision (distinct from the non-default-mode
+            // case above) stays `Ok(None)`.
+            Err(crate::manager::RevisionManagerError::RevisionNotFound { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn close(self: Box<Self>) -> Result<(), api::Error> {
+        Db::close(*self)
     }
 }
 
 impl Db {
     /// Create a new database instance.
+    ///
+    /// Returns a `Db<DefaultHashMode>`; the hash mode is carried as a runtime
+    /// value through [`DbConfig::node_hash_algorithm`]. The requested algorithm
+    /// must match the on-disk header for an existing database (enforced at
+    /// open). To open a database whose hash mode is only known at runtime, use
+    /// [`Db::open`], which returns an erased [`api::DynDb`].
     pub fn new<P: AsRef<Path>>(db_dir: P, cfg: DbConfig) -> Result<Self, api::Error> {
+        Self::new_with_hash_mode(db_dir, cfg)
+    }
+
+    /// Open a database, selecting the concrete hash mode `H` at runtime from
+    /// `algorithm`, and return it as an erased [`api::DynDb`].
+    ///
+    /// `algorithm` is the database's node-hashing scheme: for an existing
+    /// database it is the header's persisted algorithm, and for a fresh
+    /// database it is the requested algorithm to create with. The selected `H`
+    /// is validated against the on-disk header (a mismatch is an error), so a
+    /// single binary can open both an Ethereum and a MerkleDB database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened, or if `algorithm`
+    /// does not match an existing database's header.
+    pub fn open<P: AsRef<Path>>(
+        db_dir: P,
+        algorithm: NodeHashAlgorithm,
+        mut cfg: DbConfig,
+    ) -> Result<Box<dyn api::DynDb>, api::Error> {
+        cfg.node_hash_algorithm = algorithm;
+        Ok(match algorithm {
+            NodeHashAlgorithm::Ethereum => {
+                Box::new(Db::<EthHash>::new_with_hash_mode(db_dir, cfg)?)
+            }
+            NodeHashAlgorithm::MerkleDB => {
+                Box::new(Db::<MerkleDbHash>::new_with_hash_mode(db_dir, cfg)?)
+            }
+        })
+    }
+}
+
+impl<H: HashMode> Db<H> {
+    /// Create or open a database with the hash mode fixed by the type
+    /// parameter `H`. The configured [`DbConfig::node_hash_algorithm`] must
+    /// equal `H::ALGORITHM`; the open path validates it against the header.
+    fn new_with_hash_mode<P: AsRef<Path>>(db_dir: P, cfg: DbConfig) -> Result<Self, api::Error> {
+        // The hashing scheme is `H`, but the fresh-database header is stamped
+        // from `cfg.node_hash_algorithm`. Reject a config that disagrees with
+        // `H` so we never create a header that claims one mode while hashing
+        // under another (e.g. `Db::new(cfg{Ethereum})` in a MerkleDB build).
+        if cfg.node_hash_algorithm != H::ALGORITHM {
+            return Err(api::Error::FeatureNotSupported(format!(
+                "requested node hash algorithm {:?} does not match the database \
+                 type parameter's algorithm {:?}",
+                cfg.node_hash_algorithm,
+                H::ALGORITHM,
+            )));
+        }
         let config_manager = ConfigManager::builder()
             .root_dir(db_dir.as_ref().to_path_buf())
             .node_hash_algorithm(cfg.node_hash_algorithm)
@@ -173,7 +382,7 @@ impl Db {
             .root_store(cfg.root_store)
             .manager(cfg.manager)
             .build();
-        let manager = RevisionManager::new(config_manager)?;
+        let manager = RevisionManager::<H>::new(config_manager)?;
         let db = Self {
             manager,
             use_parallel: cfg.use_parallel,
@@ -181,6 +390,14 @@ impl Db {
         Ok(db)
     }
 
+    /// The node-hashing scheme this database uses.
+    #[must_use]
+    pub const fn node_hash_algorithm(&self) -> NodeHashAlgorithm {
+        H::ALGORITHM
+    }
+}
+
+impl<H: HashMode> Db<H> {
     /// Synchronously get a view, either committed or proposed
     pub fn view(&self, root_hash: HashKey) -> Result<ArcDynDbView, api::Error> {
         self.manager.view(root_hash).map_err(Into::into)
@@ -221,16 +438,19 @@ impl Db {
     fn propose_with_parent<F: Parentable>(
         &self,
         batch: impl IntoBatchIter,
-        parent: &NodeStore<F, FileBacked>,
-    ) -> Result<Proposal<'_>, api::Error> {
+        parent: &NodeStore<F, FileBacked, H>,
+    ) -> Result<Proposal<'_, H>, api::Error> {
         let propose_start = std::time::Instant::now();
         // Return immediately if the background thread is no longer running.
         self.manager.check_persist_error()?;
-        let proposal = NodeStore::new(parent)?;
+        // The proposal inherits the database's hash mode `H`, so it is hashed
+        // under `H` when finalized into an `ImmutableProposal` below (the
+        // `try_into` runs `hash_helper` with `H::ALGORITHM`).
+        let proposal: NodeStore<Mutable<Propose>, FileBacked, H> = NodeStore::new(parent)?;
         let mutable_nodestore = self
             .manager
             .apply_batch(&self.use_parallel, proposal, batch)?;
-        let immutable: Arc<NodeStore<Arc<ImmutableProposal>, FileBacked>> =
+        let immutable: Arc<NodeStore<Arc<ImmutableProposal>, FileBacked, H>> =
             Arc::new(mutable_nodestore.try_into()?);
         self.manager.add_proposal(immutable.clone());
 
@@ -257,7 +477,7 @@ impl Db {
         first_key: Option<impl KeyType>,
         last_key: Option<impl KeyType>,
         key_values: impl IntoIterator<Item: KeyValuePair>,
-    ) -> Result<Proposal<'_>, api::Error> {
+    ) -> Result<Proposal<'_, H>, api::Error> {
         self.merge_key_value_range_with_parent(
             first_key,
             last_key,
@@ -280,10 +500,10 @@ impl Db {
         first_key: Option<impl KeyType>,
         last_key: Option<impl KeyType>,
         key_values: impl IntoIterator<Item: KeyValuePair>,
-        parent: &NodeStore<F, FileBacked>,
-    ) -> Result<Proposal<'_>, api::Error>
+        parent: &NodeStore<F, FileBacked, H>,
+    ) -> Result<Proposal<'_, H>, api::Error>
     where
-        NodeStore<F, FileBacked>: TrieReader,
+        NodeStore<F, FileBacked, H>: TrieReader,
     {
         let merkle = Merkle::from(parent);
         let merge_ops = merkle.merge_key_value_range(first_key, last_key, key_values);
@@ -293,10 +513,10 @@ impl Db {
     pub fn apply_change_proof_to_parent<F: Parentable>(
         &self,
         batch_ops: impl IntoBatchIter,
-        parent: &NodeStore<F, FileBacked>,
-    ) -> Result<Proposal<'_>, api::Error>
+        parent: &NodeStore<F, FileBacked, H>,
+    ) -> Result<Proposal<'_, H>, api::Error>
     where
-        NodeStore<F, FileBacked>: HashedNodeReader,
+        NodeStore<F, FileBacked, H>: HashedNodeReader,
     {
         // Create a new proposal from the parent
         let merkle = Merkle::from(parent);
@@ -325,21 +545,21 @@ impl Db {
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
         max_length: Option<NonZeroUsize>,
-    ) -> Result<Proposal<'_>, api::Error> {
-        // PR 4: the DB is mono-mode, so the expected mode is the compile
-        // default. The verifier rejects a proof whose header advertises a
-        // different mode. (A per-DB runtime mode is PR 5.)
+    ) -> Result<Proposal<'_, H>, api::Error> {
+        // The DB's hash mode is its type parameter `H`; the proof is verified
+        // against that mode. The verifier rejects a proof whose header
+        // advertises a different mode.
         let verification = verify_change_proof_structure(
             proof,
             end_root.clone(),
             start_key,
             end_key,
-            NodeHashAlgorithm::compile_option(),
+            H::ALGORITHM,
             max_length,
         )?;
         let parent = self.manager.current_revision();
         let proposal = self.apply_change_proof_to_parent(proof, &*parent)?;
-        verify_change_proof_root_hash(proof, &verification, &proposal)?;
+        verify_change_proof_root_hash(proof, &verification, &proposal, H::ALGORITHM)?;
         Ok(proposal)
     }
 
@@ -359,8 +579,20 @@ impl Db {
         P: ReconstructionSource<FileBacked>,
         NodeStore<P, FileBacked>: TrieReader,
     {
+        // Reconstruction is hardcoded to `RevisionManager::<DefaultHashMode>`
+        // below, so it is only valid for a default-mode database. Guard the
+        // hardcode where it lives rather than relying solely on upstream gating.
+        if H::ALGORITHM != DefaultHashMode::ALGORITHM {
+            return Err(api::Error::FeatureNotSupported(format!(
+                "reconstruct is only supported for the build's default hash mode \
+                 ({:?}); this database uses {:?}",
+                DefaultHashMode::ALGORITHM,
+                H::ALGORITHM,
+            )));
+        }
         let next_nodestore = parent.reconstruction_child()?;
-        let mutable_nodestore = RevisionManager::apply_batch_recon(next_nodestore, batch)?;
+        let mutable_nodestore =
+            RevisionManager::<DefaultHashMode>::apply_batch_recon(next_nodestore, batch)?;
 
         Ok(ReconstructedView {
             db: self,
@@ -381,8 +613,19 @@ impl Db {
         parent: Arc<NodeStore<Reconstructed<FileBacked>, FileBacked>>,
         batch: impl IntoBatchIter,
     ) -> Result<ReconstructedView<'_>, api::Error> {
+        // See `reconstruct_from_view`: the `RevisionManager::<DefaultHashMode>`
+        // hardcode below is only valid for a default-mode database.
+        if H::ALGORITHM != DefaultHashMode::ALGORITHM {
+            return Err(api::Error::FeatureNotSupported(format!(
+                "reconstruct is only supported for the build's default hash mode \
+                 ({:?}); this database uses {:?}",
+                DefaultHashMode::ALGORITHM,
+                H::ALGORITHM,
+            )));
+        }
         let next_nodestore = parent.into();
-        let mutable_nodestore = RevisionManager::apply_batch_recon(next_nodestore, batch)?;
+        let mutable_nodestore =
+            RevisionManager::<DefaultHashMode>::apply_batch_recon(next_nodestore, batch)?;
 
         Ok(ReconstructedView {
             db: self,
@@ -443,17 +686,36 @@ impl Db {
 }
 
 #[derive(Debug)]
-/// A user-visible database proposal
-pub struct Proposal<'db> {
-    nodestore: Arc<NodeStore<Arc<ImmutableProposal>, FileBacked>>,
-    db: &'db Db,
+/// A user-visible database proposal.
+///
+/// `H` mirrors the parent [`Db`]'s hash mode so the proof verify/write paths
+/// can name it. The backing nodestore stays pinned to the storage-supported
+/// default mode; `H` is presently always `DefaultHashMode`.
+pub struct Proposal<'db, H = DefaultHashMode> {
+    nodestore: Arc<NodeStore<Arc<ImmutableProposal>, FileBacked, H>>,
+    db: &'db Db<H>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 /// A user-visible reconstructed view.
+///
+/// The storage reconstruction path is `DefaultHashMode`-only (see the
+/// [`api::Reconstructible`] impl and the backing nodestore type), so this
+/// view is not generic over the hash mode. The owning database is held behind
+/// the erased [`api::DynDb`] so a reconstructed view can be produced from a
+/// runtime-selected `Db<H>` without naming `H`.
 pub struct ReconstructedView<'db> {
     nodestore: Arc<NodeStore<Reconstructed<FileBacked>, FileBacked>>,
-    db: &'db Db,
+    db: &'db dyn api::DynDb,
+}
+
+impl Clone for ReconstructedView<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            nodestore: self.nodestore.clone(),
+            db: self.db,
+        }
+    }
 }
 
 impl ReconstructedView<'_> {
@@ -464,9 +726,9 @@ impl ReconstructedView<'_> {
     }
 }
 
-impl api::DbView for Proposal<'_> {
+impl<H: HashMode> api::DbView for Proposal<'_, H> {
     type Iter<'view>
-        = MerkleKeyValueIter<'view, NodeStore<Arc<ImmutableProposal>, FileBacked>>
+        = MerkleKeyValueIter<'view, NodeStore<Arc<ImmutableProposal>, FileBacked, H>>
     where
         Self: 'view;
 
@@ -500,8 +762,8 @@ impl api::DbView for Proposal<'_> {
     }
 }
 
-impl<'db> api::Proposal for Proposal<'db> {
-    type Proposal = Proposal<'db>;
+impl<'db, H: HashMode> api::Proposal for Proposal<'db, H> {
+    type Proposal = Proposal<'db, H>;
 
     fn propose(&self, batch: impl IntoBatchIter) -> Result<Self::Proposal, api::Error> {
         self.create_proposal(batch)
@@ -512,7 +774,73 @@ impl<'db> api::Proposal for Proposal<'db> {
     }
 }
 
-impl Proposal<'_> {
+// The dyn boundary for proposals. A borrowing `Proposal<'_, H>` cannot be
+// `DynDbView` (that trait is `'static`), so its read surface is mirrored here
+// by delegating to the proposal's `DbView` impl, and `view()` exposes the
+// `'static` `ArcDynDbView` for the iterator/reconstruct paths.
+impl<'db, H: HashMode> api::DynProposal<'db> for Proposal<'db, H> {
+    fn root_hash(&self) -> Option<HashKey> {
+        api::DbView::root_hash(self)
+    }
+
+    fn val(&self, key: &[u8]) -> Result<Option<Value>, api::Error> {
+        api::DbView::val(self, key)
+    }
+
+    fn single_key_proof(&self, key: &[u8]) -> Result<FrozenProof, api::Error> {
+        api::DbView::single_key_proof(self, key)
+    }
+
+    fn range_proof(
+        &self,
+        first_key: Option<&[u8]>,
+        last_key: Option<&[u8]>,
+        limit: Option<NonZeroUsize>,
+    ) -> Result<FrozenRangeProof, api::Error> {
+        api::DbView::range_proof(self, first_key, last_key, limit)
+    }
+
+    fn iter_option(
+        &self,
+        first_key: Option<&[u8]>,
+    ) -> Result<api::BoxKeyValueIter<'_>, api::Error> {
+        // NOTE: `Result::map` does not work here because the compiler cannot
+        // correctly infer the unsizing coercion (see the `DynDbView` blanket).
+        match api::DbView::iter_option(self, first_key) {
+            Ok(iter) => Ok(Box::new(iter)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn dump_to_string(&self) -> Result<String, api::Error> {
+        api::DbView::dump_to_string(self)
+    }
+
+    fn view(&self) -> ArcDynDbView {
+        Proposal::view(self)
+    }
+
+    fn propose(
+        &self,
+        ops: api::OwnedBatch,
+    ) -> Result<Box<dyn api::DynProposal<'db> + 'db>, api::Error> {
+        // `create_proposal` builds a fresh nodestore borrowing the parent
+        // `Db<H>` (lifetime `'db`), not `self`, so the result genuinely lives
+        // for `'db` even though it is created through `&self`.
+        let proposal = self.create_proposal(ops)?;
+        Ok(Box::new(proposal))
+    }
+
+    fn commit(self: Box<Self>) -> Result<(), api::Error> {
+        api::Proposal::commit(*self)
+    }
+
+    fn commit_with_rebase(self: Box<Self>) -> Result<Option<HashKey>, api::Error> {
+        Proposal::commit_with_rebase(*self)
+    }
+}
+
+impl<H: HashMode> Proposal<'_, H> {
     /// Commit the proposal, automatically rebasing if the parent revision
     /// is no longer the latest.
     ///
@@ -554,12 +882,13 @@ impl Proposal<'_> {
             // entry is not guaranteed to still be empty once `max_revisions`
             // has been exceeded.
             let empty_parent;
-            let old_parent_ref: &NodeStore<Committed, FileBacked> = if let Some(rev) = &old_parent {
-                rev
-            } else {
-                empty_parent = nodestore.empty_committed_sibling();
-                &empty_parent
-            };
+            let old_parent_ref: &NodeStore<Committed, FileBacked, H> =
+                if let Some(rev) = &old_parent {
+                    rev
+                } else {
+                    empty_parent = nodestore.empty_committed_sibling();
+                    &empty_parent
+                };
             let diff = DiffMerkleNodeStream::new(old_parent_ref, &*nodestore, Box::default())?;
             let batch_ops: Vec<BatchOp<crate::merkle::Key, crate::merkle::Value>> =
                 diff.collect::<Result<_, _>>()?;
@@ -592,7 +921,7 @@ impl Proposal<'_> {
 
     /// Returns a reference to the inner nodestore.
     #[must_use]
-    pub(crate) fn inner_nodestore(&self) -> &NodeStore<Arc<ImmutableProposal>, FileBacked> {
+    pub(crate) fn inner_nodestore(&self) -> &NodeStore<Arc<ImmutableProposal>, FileBacked, H> {
         &self.nodestore
     }
 }
@@ -633,6 +962,9 @@ impl api::DbView for ReconstructedView<'_> {
     }
 }
 
+// The storage reconstruction path is `DefaultHashMode`-only; the owning
+// database is reached through the erased [`api::DynDb`] so reconstruction works
+// off a runtime-selected `Db<H>` (in practice the binary's default mode).
 impl<'a> api::Reconstructible for ReconstructedView<'a> {
     type Reconstructed = ReconstructedView<'a>;
 
@@ -640,11 +972,27 @@ impl<'a> api::Reconstructible for ReconstructedView<'a> {
     where
         Self: Sized,
     {
-        self.db
-            .reconstruct_from_reconstructed(self.nodestore, batch)
+        let ops: api::OwnedBatch = batch
+            .into_batch_iter::<api::Error>()
+            .map(|res| {
+                res.map(|op| match op {
+                    BatchOp::Put { key, value } => BatchOp::Put {
+                        key: key.as_ref().into(),
+                        value: value.as_ref().into(),
+                    },
+                    BatchOp::Delete { key } => BatchOp::Delete {
+                        key: key.as_ref().into(),
+                    },
+                    BatchOp::DeleteRange { prefix } => BatchOp::DeleteRange {
+                        prefix: prefix.as_ref().into(),
+                    },
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.db.reconstruct_from_reconstructed(self.nodestore, ops)
     }
 
-    fn db(&self) -> &crate::db::Db {
+    fn db(&self) -> &dyn api::DynDb {
         self.db
     }
 }
