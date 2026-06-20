@@ -231,3 +231,35 @@ See [`CODE_REVIEW.md`](./CODE_REVIEW.md) for the complete set of code review che
 
 - [Auto-generated docs](https://ava-labs.github.io/firewood/firewood/)
 - [Issue tracker](https://github.com/ava-labs/firewood/issues)
+
+## Cursor Cloud specific instructions
+
+The Cloud VM snapshot comes with the required toolchains pre-installed; the
+startup update script only refreshes dependencies (`cargo fetch` + `go -C ffi
+mod download`). You do **not** need to install toolchains yourself.
+
+- **Rust**: `rustup` default is `1.94.0` (the workspace MSRV; required because
+  the crates use edition 2024). `clippy`, `rustfmt`, and `cargo-nextest` are
+  installed.
+- **Go**: `1.25.10` is installed at `/usr/local/go` and symlinked at
+  `/usr/local/bin/go`. Note an older system Go (`1.22` at `/usr/bin/go`) also
+  exists; `/usr/local/bin` precedes `/usr/bin` on `PATH`, so plain `go`
+  resolves to 1.25.10. If you ever see `go 1.22`, your `PATH` ordering is wrong.
+  The FFI Go modules require Go ≥ 1.25.10.
+
+Standard build/test/lint/doc commands are already documented above under
+**PR Strategy**. A few non-obvious caveats:
+
+- First `cargo fetch`/build needs network access to GitHub: the workspace
+  `[patch.crates-io]` redirects `metrics*` crates to a Git fork.
+- **FFI build order matters**: build the Rust staticlib *before* running Go
+  tests. The Go side locates the lib under `target/{maxperf,release,debug}/`
+  and the test hash mode must match the Rust feature build:
+  - default/sha256: `cargo build -p firewood-ffi` (in `ffi/`) then
+    `GOEXPERIMENT=cgocheck2 TEST_FIREWOOD_HASH_MODE=firewood go test -race ./...`
+  - ethhash/keccak: `cargo build --features ethhash,logger` then
+    `GOEXPERIMENT=cgocheck2 TEST_FIREWOOD_HASH_MODE=ethhash go test -race ./...`
+  (run `go test` from the `ffi/` directory). See `ffi/README.md` for details.
+- **`fwdctl` quick check**: the DB directory is passed via `-d/--db`
+  (e.g. `fwdctl create -d mydb`, `fwdctl insert KEY VALUE -d mydb`), not as a
+  positional argument.
