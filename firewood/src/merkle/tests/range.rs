@@ -643,12 +643,8 @@ fn test_bad_range_proof_modified_key<H: HashMode>() {
     kvs[mid].0 = key.into_boxed_slice();
     kvs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-    let range_proof = RangeProof::with_hash_mode(
-        start_proof,
-        end_proof,
-        kvs.into_boxed_slice(),
-        H::ALGORITHM,
-    );
+    let range_proof =
+        RangeProof::with_hash_mode(start_proof, end_proof, kvs.into_boxed_slice(), H::ALGORITHM);
     assert!(
         verify_range_proof(
             Some(items[start].0),
@@ -695,12 +691,8 @@ fn test_bad_range_proof_modified_value<H: HashMode>() {
     val[0] ^= 0x01;
     kvs[mid].1 = val.into_boxed_slice();
 
-    let range_proof = RangeProof::with_hash_mode(
-        start_proof,
-        end_proof,
-        kvs.into_boxed_slice(),
-        H::ALGORITHM,
-    );
+    let range_proof =
+        RangeProof::with_hash_mode(start_proof, end_proof, kvs.into_boxed_slice(), H::ALGORITHM);
     assert!(
         verify_range_proof(
             Some(items[start].0),
@@ -740,12 +732,8 @@ fn test_bad_range_proof_gapped_entries<H: HashMode>() {
     let mid = kvs.len() / 2;
     kvs.remove(mid);
 
-    let range_proof = RangeProof::with_hash_mode(
-        start_proof,
-        end_proof,
-        kvs.into_boxed_slice(),
-        H::ALGORITHM,
-    );
+    let range_proof =
+        RangeProof::with_hash_mode(start_proof, end_proof, kvs.into_boxed_slice(), H::ALGORITHM);
     assert!(
         verify_range_proof(
             Some(items[start].0),

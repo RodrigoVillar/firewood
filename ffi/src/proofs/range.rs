@@ -129,21 +129,16 @@ impl<'db> RangeProofContext<'db> {
 
         debug_assert!(self.verification.is_none());
 
-        // Expected mode is the compile-time default - any proof with a
-        // different mode is rejected up front. (This standalone verify path
-        // has no database handle in scope to recover a runtime mode from;
-        // `NodeHashAlgorithm::compile_option` was removed with runtime
-        // selection, so the cfg-selected default is spelled out here.)
+        // EthHash: this standalone verify path has no database handle in scope,
+        // so the expected mode is the locked Ethereum default. The verifier
+        // rejects a proof whose header advertises a different mode. Threading a
+        // per-DB runtime mode recovered from the handle is a later enhancement.
         self.verification = Some(firewood::verify_range_proof_structure(
             &self.proof,
             root,
             start_key,
             end_key,
-            if cfg!(feature = "ethhash") {
-                NodeHashAlgorithm::Ethereum
-            } else {
-                NodeHashAlgorithm::MerkleDB
-            },
+            NodeHashAlgorithm::Ethereum,
             max_length,
         )?);
         Ok(())
